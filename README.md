@@ -16,10 +16,11 @@ The overall workflow is:
 3. Optionally compare those observed regions to one or more expected library TSVs
 4. Write TSV outputs describing observed combinations, inferred library assignments, summary counts, and filtered reads
 
-Four region extraction algorithms are currently implemented:
+Five region extraction algorithms are currently implemented:
 
 * **Alignment**: Align reads to the template via semi-global alignment. This is the most robust option for most construct designs and the default mode. It handles variable-length regions and is the best choice when reads may contain substitutions or indels, but it is also the slowest by a significant margin. There are also constructs where robust alignment is difficult, even after tuning parameters, in which case pattern matching is generally a good alternative.
 * **Pattern matching**: Identify variable regions using fixed flanking sequences from the constant regions. This is faster than alignment and still supports variable-length regions, but it is less robust when mutations occur in the flanking regions. Once a region is missed, downstream regions in the same read may also be missed.
+* **Anchored pattern matching**: Use flank patterns plus the configured read-start boundaries to identify complete fixed-length regions at the edge of a read. This supports guides whose outer scaffold lies outside the sequenced fragment. See [paired region extraction](docs/paired-region-extraction.md) for optional mate coverage and agreement requirements.
 * **Inframe**: Extract regions from their expected positions within the read. This is very fast, but it assumes reads are already in the expected frame and is only suitable when region lengths are fixed and read structure is well controlled.
 * **full-read**: Count complete read sequences. This is the simplest and fastest mode but does not interpret internal structure.
 
@@ -73,7 +74,7 @@ Input/Output:
   -o, --output <OUTPUT>  Prefix for output TSV files [default: read_counts]
 
 Counting:
-  -m, --mode <MODE>    Method for extracting regions of interest [default: align] [possible values: full-read, inframe, pattern, align]
+  -m, --mode <MODE>    Method for extracting regions of interest [default: align] [possible values: full-read, inframe, pattern, anchored-pattern, align]
   -g, --group <GROUP>  Group counts by applying this capture group regex to forward read names and extracting the first capture group match
 
 Library Comparison:

@@ -472,6 +472,13 @@ fn merge_paired_region(
         return Ok(None);
     }
 
+    if lib_spec.get_region(id)?.requires_mate_agreement() {
+        match (&fwd, &rev) {
+            (Some(f), Some(r)) if f.0 == r.0 => {}
+            _ => return Ok(None),
+        }
+    }
+
     merge_seqs(fwd, rev, len)
 }
 
@@ -700,6 +707,51 @@ fn match_flank_patterns(
     Ok(out)
 }
 
+/// Extract flanked regions and use the configured read-start boundary as the
+/// missing outer anchor for a fixed-length region. Reverse reads are already
+/// reverse-complemented, so their start boundary is the end of `seq`.
+fn match_anchored_patterns(
+    seq: &[u8],
+    qual: &[u8],
+    flanks: &[FlankingSequences],
+    tolerance: u64,
+    lib_spec: &LibrarySpec,
+    reverse: bool,
+) -> Result<Vec<Option<RegionMatch>>, anyhow::Error> {
+    let mut matches = match_flank_patterns(seq, qual, flanks, tolerance)?;
+    let start_id = if reverse {
+        &lib_spec.reverse_start_region
+    } else {
+        &lib_spec.forward_start_region
+    };
+    for (id, observation) in zip(lib_spec.variable_regions(), &mut matches) {
+        if &id != start_id {
+            continue;
+        }
+        if let crate::lib_spec::Region::Library {
+            min_length,
+            max_length,
+            ..
+        } = lib_spec.get_region(&id)?
+        {
+            if min_length != max_length {
+                continue;
+            }
+            if let Some((observed, _, completeness)) = observation {
+                let boundary = if reverse {
+                    *completeness == RegionCompleteness::Partial3Prime && seq.ends_with(observed)
+                } else {
+                    *completeness == RegionCompleteness::Partial5Prime && seq.starts_with(observed)
+                };
+                if boundary && observed.len() == *max_length {
+                    *completeness = RegionCompleteness::Complete;
+                }
+            }
+        }
+    }
+    Ok(matches)
+}
+
 /// Extract ObservedCombinations from a worker thread JoinHandle
 ///
 /// Returns the appropriate result or an error that can be raised via ?
@@ -755,6 +807,11 @@ pub enum CountMode {
     /// intact flanking sequence and only recovers a continuous block of regions.
     Pattern,
 
+    /// Flank-pattern extraction with configured read-start boundary anchors.
+    /// Fixed-length regions ending at a known read boundary can be complete
+    /// even when the outer flank lies outside the sequenced fragment.
+    AnchoredPattern,
+
     /// Extract regions by semi-global alignment to the full template.
     ///
     /// Most robust and the default choice for complex or noisy data, but slowest.
@@ -796,6 +853,17 @@ pub fn count_reads<T: ReadPairProducer>(
     let default_progress = ProgressStyle::new(None, false);
     let progress = progress_style.unwrap_or(&default_progress);
 
+    if let Some(spec) = lib_spec {
+        for region in &spec.regions {
+            let (forward, reverse) = region.mate_requirements();
+            if (forward || reverse) && (!reads.has_reverse() || mode == CountMode::FullRead) {
+                return Err(ReadCountError::Error {
+                    desc: "Per-mate region requirements need paired reads and a structured counting mode".to_string(),
+                }.into());
+            }
+        }
+    }
+
     match threads.cmp(&1) {
         std::cmp::Ordering::Less => Err(ReadCountError::Error {
             desc: "Threads must be >0".to_string(),
@@ -822,37 +890,50 @@ pub fn count_reads<T: ReadPairProducer>(
                     count_paired_align(reads, lib_spec, full_seq, filter_config, a, cache, progress)
                 }
 
-                (_, _, CountMode::Pattern, _, None, _) | (_, _, CountMode::Pattern, _, _, None) => {
+                (_, _, CountMode::Pattern | CountMode::AnchoredPattern, _, None, _)
+                | (_, _, CountMode::Pattern | CountMode::AnchoredPattern, _, _, None) => {
                     Err(ReadCountError::Error {
                         desc: "Mode is 'pattern' but pattern length and/or tolerance is missing"
                             .to_string(),
                     }
                     .into())
                 }
-                (false, Some(lib_spec), CountMode::Pattern, _, Some(len), Some(tol)) => {
-                    count_single_pattern(
-                        reads,
-                        lib_spec,
-                        full_seq,
-                        filter_config,
-                        len,
-                        tol,
-                        cache,
-                        progress,
-                    )
-                }
-                (true, Some(lib_spec), CountMode::Pattern, _, Some(len), Some(tol)) => {
-                    count_paired_pattern(
-                        reads,
-                        lib_spec,
-                        full_seq,
-                        filter_config,
-                        len,
-                        tol,
-                        cache,
-                        progress,
-                    )
-                }
+                (
+                    false,
+                    Some(lib_spec),
+                    pattern_mode @ (CountMode::Pattern | CountMode::AnchoredPattern),
+                    _,
+                    Some(len),
+                    Some(tol),
+                ) => count_single_pattern(
+                    reads,
+                    lib_spec,
+                    full_seq,
+                    filter_config,
+                    len,
+                    tol,
+                    pattern_mode == CountMode::AnchoredPattern,
+                    cache,
+                    progress,
+                ),
+                (
+                    true,
+                    Some(lib_spec),
+                    pattern_mode @ (CountMode::Pattern | CountMode::AnchoredPattern),
+                    _,
+                    Some(len),
+                    Some(tol),
+                ) => count_paired_pattern(
+                    reads,
+                    lib_spec,
+                    full_seq,
+                    filter_config,
+                    len,
+                    tol,
+                    pattern_mode == CountMode::AnchoredPattern,
+                    cache,
+                    progress,
+                ),
 
                 (false, Some(lib_spec), CountMode::Inframe, _, _, _) => {
                     count_single_inframe(reads, lib_spec, full_seq, filter_config, cache, progress)
@@ -1375,6 +1456,7 @@ fn count_single_pattern<T: ReadPairProducer>(
     filter_config: FilterConfig,
     pattern_length: usize,
     pattern_tolerance: u64,
+    anchored: bool,
     cache: bool,
     progress_style: &ProgressStyle,
 ) -> Result<ObservedCombinations, anyhow::Error> {
@@ -1418,12 +1500,23 @@ fn count_single_pattern<T: ReadPairProducer>(
             continue;
         }
 
-        let region_matches = match_flank_patterns(
-            record.forward.seq(),
-            record.forward.qual(),
-            &flank_regions,
-            pattern_tolerance,
-        )?;
+        let region_matches = if anchored {
+            match_anchored_patterns(
+                record.forward.seq(),
+                record.forward.qual(),
+                &flank_regions,
+                pattern_tolerance,
+                lib_spec,
+                false,
+            )?
+        } else {
+            match_flank_patterns(
+                record.forward.seq(),
+                record.forward.qual(),
+                &flank_regions,
+                pattern_tolerance,
+            )?
+        };
 
         let comb_key: CombinationKey = CombinationKey::new(
             if full_seq {
@@ -1464,6 +1557,7 @@ fn count_paired_pattern<T: ReadPairProducer>(
     filter_config: FilterConfig,
     pattern_length: usize,
     pattern_tolerance: u64,
+    anchored: bool,
     cache: bool,
     progress_style: &ProgressStyle,
 ) -> Result<ObservedCombinations, anyhow::Error> {
@@ -1540,9 +1634,31 @@ fn count_paired_pattern<T: ReadPairProducer>(
             }
         };
 
-        let f_matches = match_flank_patterns(f_seq, f_qual, &flank_regions, pattern_tolerance)?;
-
-        let r_matches = match_flank_patterns(&r_seq, &r_qual, &flank_regions, pattern_tolerance)?;
+        let (f_matches, r_matches) = if anchored {
+            (
+                match_anchored_patterns(
+                    f_seq,
+                    f_qual,
+                    &flank_regions,
+                    pattern_tolerance,
+                    lib_spec,
+                    false,
+                )?,
+                match_anchored_patterns(
+                    &r_seq,
+                    &r_qual,
+                    &flank_regions,
+                    pattern_tolerance,
+                    lib_spec,
+                    true,
+                )?,
+            )
+        } else {
+            (
+                match_flank_patterns(f_seq, f_qual, &flank_regions, pattern_tolerance)?,
+                match_flank_patterns(&r_seq, &r_qual, &flank_regions, pattern_tolerance)?,
+            )
+        };
 
         let mut comb_key: CombinationKey = CombinationKey::new(
             if full_seq {
@@ -2047,6 +2163,108 @@ mod tests {
         assert_eq!(scorer.score(b'N', b'A'), -2);
         assert_eq!(scorer.score(b'A', b'N'), -2);
         assert_eq!(scorer.score(b'A', b'T'), -3);
+    }
+
+    fn boundary_pattern_spec() -> LibrarySpec {
+        LibrarySpec::from_str(
+            r#"{
+            "id": "boundary-test", "forward_start_region": "guide1",
+            "forward_read_length": 20, "reverse_start_region": "guide2",
+            "reverse_read_length": 8, "regions": [
+                {"id":"guide1", "seq_type":"Library", "min_length":4, "max_length":4},
+                {"id":"spacer", "seq_type":"Fixed", "seq":"TTTTGGGG"},
+                {"id":"guide2", "seq_type":"Library", "min_length":4, "max_length":4,
+                 "require_mate_agreement":true},
+                {"id":"tail", "seq_type":"Fixed", "seq":"CCCC"}
+            ]
+        }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn anchored_pattern_recovers_reverse_read_boundary_without_promoting_truncation() {
+        let spec = boundary_pattern_spec();
+        let flanks = spec.get_all_flanking_regions(4).unwrap();
+        let seq = b"GGGGACGT";
+        let legacy = match_flank_patterns(seq, b"IIIIIIII", &flanks, 0).unwrap();
+        assert_eq!(
+            legacy[1].as_ref().unwrap().2,
+            RegionCompleteness::Partial3Prime
+        );
+        let anchored = match_anchored_patterns(seq, b"IIIIIIII", &flanks, 0, &spec, true).unwrap();
+        assert_eq!(
+            anchored[1].as_ref().unwrap().2,
+            RegionCompleteness::Complete
+        );
+        assert_eq!(anchored[1].as_ref().unwrap().0, b"ACGT");
+        let truncated =
+            match_anchored_patterns(b"GGGGACG", b"IIIIIII", &flanks, 0, &spec, true).unwrap();
+        assert_eq!(
+            truncated[1].as_ref().unwrap().2,
+            RegionCompleteness::Partial3Prime
+        );
+        let wrong_boundary =
+            match_anchored_patterns(seq, b"IIIIIIII", &flanks, 0, &spec, false).unwrap();
+        assert_eq!(
+            wrong_boundary[1].as_ref().unwrap().2,
+            RegionCompleteness::Partial3Prime
+        );
+        let missing_anchor =
+            match_anchored_patterns(b"ACGT", &[40; 4], &flanks, 0, &spec, true).unwrap();
+        assert!(missing_anchor[1].is_none());
+        let too_long =
+            match_anchored_patterns(b"GGGGACGTA", &[40; 9], &flanks, 0, &spec, true).unwrap();
+        assert_eq!(
+            too_long[1].as_ref().unwrap().2,
+            RegionCompleteness::Partial3Prime
+        );
+        let forward =
+            match_anchored_patterns(b"ACTGTTTT", &[40; 8], &flanks, 0, &spec, false).unwrap();
+        assert_eq!(forward[0].as_ref().unwrap().2, RegionCompleteness::Complete);
+        let mut variable_spec = spec.clone();
+        if let crate::lib_spec::Region::Library { min_length, .. } = &mut variable_spec.regions[2] {
+            *min_length = 3;
+        }
+        let variable =
+            match_anchored_patterns(seq, b"IIIIIIII", &flanks, 0, &variable_spec, true).unwrap();
+        assert_eq!(
+            variable[1].as_ref().unwrap().2,
+            RegionCompleteness::Partial3Prime
+        );
+    }
+
+    #[test]
+    fn anchored_pattern_requires_same_oriented_guide_from_both_mates() {
+        let spec = boundary_pattern_spec();
+        let flanks = spec.get_all_flanking_regions(4).unwrap();
+        let fwd =
+            match_anchored_patterns(b"ACGTTTTTGGGGACTGCCCC", &[40; 20], &flanks, 0, &spec, false)
+                .unwrap();
+        let raw_reverse = b"CAGTCCCC";
+        let canonical_reverse = revcomp(raw_reverse);
+        let reverse =
+            match_anchored_patterns(&canonical_reverse, &[40; 8], &flanks, 0, &spec, true).unwrap();
+        let id = region_id_from_str("guide2");
+        assert!(
+            merge_paired_region(&spec, &id, fwd[1].clone(), reverse[1].clone(), 4)
+                .unwrap()
+                .is_some()
+        );
+        let disagreeing =
+            match_anchored_patterns(b"GGGGACGA", &[40; 8], &flanks, 0, &spec, true).unwrap();
+        assert!(
+            merge_paired_region(&spec, &id, fwd[1].clone(), disagreeing[1].clone(), 4)
+                .unwrap()
+                .is_none()
+        );
+        let wrong_orientation =
+            match_anchored_patterns(raw_reverse, &[40; 8], &flanks, 0, &spec, true).unwrap();
+        assert!(
+            merge_paired_region(&spec, &id, fwd[1].clone(), wrong_orientation[1].clone(), 4)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

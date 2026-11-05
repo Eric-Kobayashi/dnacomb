@@ -31,6 +31,7 @@ use dnacomb::{
 /// Supported counting modes:
 /// - `align`: semi-global alignment to the LibSpec template; most robust, slowest
 /// - `pattern`: flank-pattern matching; faster, less robust to flank mutations
+/// - `anchored-pattern`: pattern matching with configured read-start boundary anchors
 /// - `inframe`: positional extraction from expected read coordinates; fastest structured mode
 /// - `full-read`: count complete read sequences without structured extraction
 ///
@@ -184,7 +185,7 @@ struct Cli {
     #[arg(long, default_value_t = 10, help_heading = "Pattern Matching")]
     pattern_length: usize,
 
-    /// Number of mismatches to accept while matching flanking patterns. Only using in pattern mode.
+    /// Number of mismatches to accept while matching flanks in pattern and anchored-pattern modes.
     #[arg(long, default_value_t = 1, help_heading = "Pattern Matching")]
     pattern_tolerance: u64,
 

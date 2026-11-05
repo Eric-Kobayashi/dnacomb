@@ -87,6 +87,9 @@ pub enum Region {
         require_forward_complete: bool,
         #[serde(default)]
         require_reverse_complete: bool,
+        /// Require complete, identical observations from both oriented mates.
+        #[serde(default)]
+        require_mate_agreement: bool,
     },
 
     /// A fixed region such as a primer or scaffold sequence
@@ -146,10 +149,25 @@ impl Region {
             Region::Library {
                 require_forward_complete,
                 require_reverse_complete,
+                require_mate_agreement,
                 ..
-            } => (*require_forward_complete, *require_reverse_complete),
+            } => (
+                *require_forward_complete || *require_mate_agreement,
+                *require_reverse_complete || *require_mate_agreement,
+            ),
             Region::Fixed { .. } => (false, false),
         }
+    }
+
+    /// Whether complete observations from both mates must have equal sequences.
+    pub fn requires_mate_agreement(&self) -> bool {
+        matches!(
+            self,
+            Region::Library {
+                require_mate_agreement: true,
+                ..
+            }
+        )
     }
 
     /// Validate region-level constraints.
@@ -733,6 +751,7 @@ mod tests {
             max_distance: max_dist,
             require_forward_complete: false,
             require_reverse_complete: false,
+            require_mate_agreement: false,
         }
     }
 
