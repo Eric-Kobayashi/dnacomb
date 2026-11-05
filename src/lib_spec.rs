@@ -72,6 +72,8 @@ pub enum Region {
     /// max_length: maximum expected length
     /// max_distance: maximum number of mismatches for an observed sequence to be considered
     /// a library match
+    /// require_forward_complete: require a complete forward-mate observation for this region
+    /// require_reverse_complete: require a complete reverse-mate observation for this region
     Library {
         #[serde(
             deserialize_with = "deserialize_region_id",
@@ -81,6 +83,10 @@ pub enum Region {
         min_length: usize,
         max_length: usize,
         max_distance: Option<u64>,
+        #[serde(default)]
+        require_forward_complete: bool,
+        #[serde(default)]
+        require_reverse_complete: bool,
     },
 
     /// A fixed region such as a primer or scaffold sequence
@@ -129,6 +135,21 @@ impl Region {
     /// Return true if the region is variable (i.e. to be extracted during counting)
     pub fn is_variable(&self) -> bool {
         matches!(self, Region::Library { .. })
+    }
+
+    /// Return whether a paired read must provide complete evidence for this region.
+    ///
+    /// The requirement applies after orienting the reverse read into construct
+    /// orientation. Library matching still uses the merged extracted sequence.
+    pub fn mate_requirements(&self) -> (bool, bool) {
+        match self {
+            Region::Library {
+                require_forward_complete,
+                require_reverse_complete,
+                ..
+            } => (*require_forward_complete, *require_reverse_complete),
+            Region::Fixed { .. } => (false, false),
+        }
     }
 
     /// Validate region-level constraints.
@@ -710,6 +731,8 @@ mod tests {
             min_length: min_len,
             max_length: max_len,
             max_distance: max_dist,
+            require_forward_complete: false,
+            require_reverse_complete: false,
         }
     }
 
@@ -748,6 +771,57 @@ mod tests {
         let region_full = create_test_region_fixed("r2", b"ATCG");
         assert!(region_empty.is_empty());
         assert!(!region_full.is_empty());
+    }
+
+    #[test]
+    fn test_library_region_mate_requirements_default_to_false() {
+        let spec = LibrarySpec::from_str(
+            r#"{
+                "id": "test",
+                "forward_start_region": "guide",
+                "forward_read_length": 20,
+                "reverse_start_region": "guide",
+                "reverse_read_length": 20,
+                "regions": [{
+                    "id": "guide", "seq_type": "Library",
+                    "min_length": 20, "max_length": 20, "max_distance": 0
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.get_region(&region_id_from_str("guide"))
+                .unwrap()
+                .mate_requirements(),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn test_library_region_mate_requirements_parse() {
+        let spec = LibrarySpec::from_str(
+            r#"{
+                "id": "test",
+                "forward_start_region": "guide",
+                "forward_read_length": 20,
+                "reverse_start_region": "guide",
+                "reverse_read_length": 20,
+                "regions": [{
+                    "id": "guide", "seq_type": "Library",
+                    "min_length": 20, "max_length": 20, "max_distance": 0,
+                    "require_forward_complete": true, "require_reverse_complete": true
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.get_region(&region_id_from_str("guide"))
+                .unwrap()
+                .mate_requirements(),
+            (true, true)
+        );
     }
 
     #[test]

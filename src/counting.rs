@@ -26,7 +26,7 @@ use crate::combination::CombinationKey;
 use crate::combinations::{CacheHit, ObservedCombinations};
 use crate::errors::{AlignmentInfo, LibSpecError, ReadCountError};
 use crate::filters::FilterConfig;
-use crate::interning::seq_from_bytes;
+use crate::interning::{RegionID, seq_from_bytes};
 use crate::lib_spec::{FlankingSequences, LibrarySpec};
 use crate::logging::{Progress, ProgressStyle};
 use crate::parsing::{ReadPairProducer, ThreadedReadPairParser};
@@ -449,6 +449,30 @@ fn merge_seqs(
             }
         }
     }
+}
+
+/// Merge paired observations while applying optional per-region mate requirements.
+///
+/// Required mates must cover the complete region after the reverse read is
+/// oriented into construct direction. Library matching is applied subsequently
+/// to the merged extracted sequence.
+fn merge_paired_region(
+    lib_spec: &LibrarySpec,
+    id: &RegionID,
+    fwd: Option<RegionMatch>,
+    rev: Option<RegionMatch>,
+    len: usize,
+) -> Result<Option<(Sequence, RegionCompleteness)>, anyhow::Error> {
+    let (require_forward, require_reverse) = lib_spec.get_region(id)?.mate_requirements();
+
+    let is_complete =
+        |x: &Option<RegionMatch>| matches!(x, Some((_, _, RegionCompleteness::Complete)));
+
+    if (require_forward && !is_complete(&fwd)) || (require_reverse && !is_complete(&rev)) {
+        return Ok(None);
+    }
+
+    merge_seqs(fwd, rev, len)
 }
 
 /// Extract variable regions by searching for flanking fixed-sequence patterns.
@@ -1194,6 +1218,13 @@ fn count_paired_align<T: ReadPairProducer>(
         );
 
         for (id, len, f_pos, r_pos) in izip!(&regions, &region_lengths, &f_regions, &r_regions) {
+            let (require_forward, require_reverse) = lib_spec.get_region(id)?.mate_requirements();
+            if (require_forward && !matches!(f_pos, Some((_, _, RegionCompleteness::Complete))))
+                || (require_reverse && !matches!(r_pos, Some((_, _, RegionCompleteness::Complete))))
+            {
+                continue;
+            }
+
             match (f_pos, r_pos) {
                 (None, None) => continue,
                 (None, Some(r)) => {
@@ -1301,7 +1332,9 @@ fn count_paired_align<T: ReadPairProducer>(
                         .get((r.0 - 1)..(r.1 - 1))
                         .expect("If seq extracted then qual should be too as the same length");
 
-                    match merge_seqs(
+                    match merge_paired_region(
+                        lib_spec,
+                        id,
                         Some((f_reg_seq.to_vec(), f_reg_qual.to_vec(), f.2)),
                         Some((r_reg_seq.to_vec(), r_reg_qual.to_vec(), r.2)),
                         *len,
@@ -1521,7 +1554,7 @@ fn count_paired_pattern<T: ReadPairProducer>(
         );
 
         for (id, len, fwd, rev) in izip!(&regions, &region_lengths, f_matches, r_matches) {
-            if let Some(merged) = merge_seqs(fwd, rev, *len)? {
+            if let Some(merged) = merge_paired_region(lib_spec, id, fwd, rev, *len)? {
                 comb_key.regions.push(RegionKey::new(
                     id.clone(),
                     seq_from_bytes(&merged.0),
@@ -1864,7 +1897,7 @@ fn count_paired_inframe<T: ReadPairProducer>(
             }
 
             // Determine which read to use
-            match merge_seqs(fwd, rev, *len)? {
+            match merge_paired_region(lib_spec, id, fwd, rev, *len)? {
                 Some((seq, comp)) => {
                     comb_key
                         .regions
@@ -1930,12 +1963,14 @@ mod tests {
     use crate::errors::ReadPairError;
     use crate::filters::FilterConfig;
     use crate::groups::ReadGroup;
+    use crate::interning::region_id_from_str;
     use crate::lib_spec::FlankingSequences;
     use crate::parsing::ReadPairProducer;
     use crate::region::RegionCompleteness;
     use bio::alignment::AlignmentOperation;
     use bio::io::fastq;
     use regex::Regex;
+    use std::str::FromStr;
 
     struct MockProducer {
         items: std::vec::IntoIter<Result<ReadPair, ReadPairError>>,
@@ -2012,6 +2047,43 @@ mod tests {
         assert_eq!(scorer.score(b'N', b'A'), -2);
         assert_eq!(scorer.score(b'A', b'N'), -2);
         assert_eq!(scorer.score(b'A', b'T'), -3);
+    }
+
+    #[test]
+    fn strict_paired_region_requires_complete_mates() {
+        let lib_spec = LibrarySpec::from_str(
+            r#"{
+                "id": "test",
+                "forward_start_region": "guide",
+                "forward_read_length": 20,
+                "reverse_start_region": "guide",
+                "reverse_read_length": 20,
+                "regions": [{
+                    "id": "guide", "seq_type": "Library",
+                    "min_length": 4, "max_length": 4, "max_distance": 0,
+                    "require_forward_complete": true, "require_reverse_complete": true
+                }]
+            }"#,
+        )
+        .unwrap();
+        let complete = |seq: &[u8]| {
+            Some((
+                seq.to_vec(),
+                vec![40; seq.len()],
+                RegionCompleteness::Complete,
+            ))
+        };
+        let id = region_id_from_str("guide");
+
+        assert!(
+            merge_paired_region(&lib_spec, &id, complete(b"ACGT"), None, 4)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            merge_paired_region(&lib_spec, &id, complete(b"ACGT"), complete(b"TGCA"), 4).unwrap(),
+            Some((b"ACGT".to_vec(), RegionCompleteness::Complete))
+        );
     }
 
     #[test]
